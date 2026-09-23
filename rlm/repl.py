@@ -10,22 +10,18 @@ from dataclasses import dataclass
 from typing import Optional
 
 from rlm import RLM
+from rlm.utils.llm import OpenAIClient
+from rlm.utils.llm import JevClient
 
 # Simple sub LM for REPL environment. Note: This could also be just the RLM itself!
 class Sub_RLM(RLM):
     """Recursive LLM client for REPL environment with fixed configuration."""
     
-    def __init__(self, model: str = "gpt-5"):
-        # Configuration - model can be specified
-        self.api_key = os.getenv("OPENAI_API_KEY")
-        if not self.api_key:
-            raise ValueError("OPENAI_API_KEY environment variable is required")
-        
+    def __init__(self, model: str = "deepseek/deepseek-v4-flash-0731", api_key: Optional[str] = None, provider: str = "openrouter", trace_callback=None, progress_callback=None):
         self.model = model
-
-        # Initialize OpenAI client
-        from rlm.utils.llm import OpenAIClient
-        self.client = OpenAIClient(api_key=self.api_key, model=model)
+        self.client = OpenAIClient(api_key=api_key, model=model, provider=provider)
+        self.trace_callback = trace_callback
+        self.progress_callback = progress_callback
         
     
     def completion(self, prompt) -> str:
@@ -33,15 +29,25 @@ class Sub_RLM(RLM):
         Simple LM query for sub-LM call.
         """
         try:
+            if self.progress_callback:
+                self.progress_callback(f"Recursive LLM request started ({len(str(prompt)):,} prompt characters)")
+            start = time.perf_counter()
             # Handle both string and dictionary/list inputs
             response = self.client.completion(
                 messages=prompt,
                 timeout=300
             )
-            
+            if self.trace_callback:
+                self.trace_callback({"type": "recursive_llm", "model": self.model,
+                                     "request": prompt, "response": response})
+            if self.progress_callback:
+                elapsed = time.perf_counter() - start
+                self.progress_callback(f"Recursive LLM response received ({elapsed:.1f}s)")
             return response
                 
         except Exception as e:
+            if self.progress_callback:
+                self.progress_callback(f"Recursive LLM request failed: {e}")
             error_msg = f"Error making LLM query: {str(e)}"
             return error_msg
     
@@ -71,20 +77,34 @@ class REPLResult:
 class REPLEnv:
     def __init__(
         self,
-        recursive_model: str = "gpt-5-mini",
+        recursive_model: str = "deepseek/deepseek-v4-flash-0731",
         context_json: Optional[dict | list] = None,
         context_str: Optional[str] = None,
         setup_code: str = None,
+        api_key: Optional[str] = None,
+        provider: str = "openrouter",
+        jev_model: Optional[str] = None,
+        trace_callback=None,
+        progress_callback=None,
     ):
         # Store the original working directory
         self.original_cwd = os.getcwd()
         
         # Create temporary directory (but don't change global working directory)
         self.temp_dir = tempfile.mkdtemp(prefix="repl_env_")
+        self.trace_callback = trace_callback
+        self.progress_callback = progress_callback
 
 
         # Initialize minimal RLM / LM client. Change this to support more depths.
-        self.sub_rlm: RLM = Sub_RLM(model=recursive_model)
+        self.sub_rlm: RLM = Sub_RLM(model=recursive_model, api_key=api_key, provider=provider,
+                                    trace_callback=trace_callback, progress_callback=progress_callback)
+        self.jev = None
+        if jev_model is not None:
+            if provider.lower() != "openrouter":
+                raise ValueError("Jev decisions require provider='openrouter'")
+            self.jev = JevClient(api_key=api_key, model=jev_model, trace_callback=trace_callback,
+                                 progress_callback=progress_callback)
         
         # Create safe globals with only string-safe built-ins
         self.globals = {
@@ -167,11 +187,22 @@ class REPLEnv:
         self.load_context(context_json, context_str)
         
         def llm_query(prompt: str) -> str:
-            """Query the LLM with the given prompt."""
+            """Query the recursive LLM with a text prompt; return its response as a string.
+
+            Args:
+                prompt: The text or focused context chunk to analyze.
+            """
             return self.sub_rlm.completion(prompt)
         
         # Add (R)LM query function to globals
         self.globals['llm_query'] = llm_query
+
+        # Jev is exposed as explicit structured decision calls. Keep the state
+        # argument visible so callers can pass a relevant snippet, not a huge prompt.
+        if self.jev is not None:
+            self.globals['choice'] = self.jev.choice
+            self.globals['score'] = self.jev.score
+            self.globals['noul'] = self.jev.noul
         
         # Add FINAL_VAR function to globals
         def final_var(variable_name: str) -> str:
@@ -352,6 +383,11 @@ class REPLEnv:
         # Store output in locals for access
         self.locals['_stdout'] = stdout_content
         self.locals['_stderr'] = stderr_content
+
+        if self.trace_callback:
+            self.trace_callback({"type": "repl_execution", "code": code,
+                                 "stdout": stdout_content, "stderr": stderr_content,
+                                 "execution_time": execution_time})
         
         return REPLResult(stdout_content, stderr_content, self.locals.copy(), execution_time)
     

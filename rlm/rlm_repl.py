@@ -3,6 +3,7 @@ Simple Recursive Language Model (RLM) with REPL environment.
 """
 
 from typing import Dict, List, Optional, Any 
+from datetime import datetime, timezone
 
 from rlm import RLM
 from rlm.repl import REPLEnv
@@ -21,16 +22,24 @@ class RLM_REPL(RLM):
     
     def __init__(self, 
                  api_key: Optional[str] = None, 
-                 model: str = "gpt-5",
-                 recursive_model: str = "gpt-5",
+                 model: str = "deepseek/deepseek-v4-flash-0731",
+                 recursive_model: str = "deepseek/deepseek-v4-flash-0731",
+                 provider: str = "openrouter",
+                 jev_model: Optional[str] = None,
                  max_iterations: int = 20,
                  depth: int = 0,
                  enable_logging: bool = False,
+                 progress_callback=None,
                  ):
         self.api_key = api_key
         self.model = model
         self.recursive_model = recursive_model
-        self.llm = OpenAIClient(api_key, model) # Replace with other client
+        self.provider = provider.lower()
+        self.jev_model = jev_model
+        self.progress_callback = progress_callback
+        if jev_model is not None and self.provider != "openrouter":
+            raise ValueError("Jev decisions require provider='openrouter'")
+        self.llm = OpenAIClient(api_key, model, provider=provider)
         
         # Track recursive call depth to prevent infinite loops
         self.repl_env = None
@@ -43,6 +52,15 @@ class RLM_REPL(RLM):
         
         self.messages = [] # Initialize messages list
         self.query = None
+        self.trace_events = []
+
+    def _record_trace(self, event: dict) -> None:
+        """Append one JSON-serializable interaction to this run's trace."""
+        self.trace_events.append({
+            "sequence": len(self.trace_events) + 1,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            **event,
+        })
     
     def setup_context(self, context: List[str] | str | List[Dict[str, str]], query: Optional[str] = None):
         """
@@ -59,7 +77,7 @@ class RLM_REPL(RLM):
         self.logger.log_query_start(query)
 
         # Initialize the conversation with the REPL prompt
-        self.messages = build_system_prompt()
+        self.messages = build_system_prompt(jev_enabled=self.jev_model is not None)
         self.logger.log_initial_messages(self.messages)
         
         # Initialize REPL environment with context data
@@ -69,6 +87,11 @@ class RLM_REPL(RLM):
             context_json=context_data, 
             context_str=context_str, 
             recursive_model=self.recursive_model,
+            api_key=self.api_key,
+            provider=self.provider,
+            jev_model=self.jev_model,
+            trace_callback=self._record_trace,
+            progress_callback=self.progress_callback,
         )
         
         return self.messages
@@ -78,13 +101,29 @@ class RLM_REPL(RLM):
         Given a query and a (potentially long) context, recursively call the LM
         to explore the context and provide an answer using a REPL environment.
         """
+        self.trace_events = []
+        self._record_trace({"type": "run_started", "query": query, "jev_enabled": self.jev_model is not None})
         self.messages = self.setup_context(context, query)
         
         # Main loop runs for fixed # of root LM iterations
         for iteration in range(self._max_iterations):
             
             # Query root LM to interact with REPL environment
-            response = self.llm.completion(self.messages + [next_action_prompt(query, iteration)])
+            request_messages = self.messages + [next_action_prompt(query, iteration)]
+            if self.progress_callback:
+                self.progress_callback(f"Root LLM request {iteration + 1} started")
+            try:
+                response = self.llm.completion(request_messages)
+            except Exception as exc:
+                if self.progress_callback:
+                    self.progress_callback(f"Root LLM request {iteration + 1} failed: {exc}")
+                self._record_trace({"type": "root_llm", "model": self.model,
+                                    "request": request_messages, "error": str(exc)})
+                raise
+            if self.progress_callback:
+                self.progress_callback(f"Root LLM response {iteration + 1} received")
+            self._record_trace({"type": "root_llm", "model": self.model,
+                                "request": request_messages, "response": response})
             
             # Check for code blocks
             code_blocks = utils.find_code_blocks(response)

@@ -1,0 +1,26 @@
+[
+  {
+    "use_jev": true,
+    "seed": 42,
+    "num_llm_calls": 10,
+    "num_recursive_llm_calls": 1,
+    "num_jev_calls": 82,
+    "total_llm_chars_in": 70055,
+    "total_recursive_llm_chars_in": 143,
+    "total_jev_chars_in": 8188252,
+    "time": 1081.046878600002,
+    "result": "\"The magic number is 2867825.\""
+  },
+  {
+    "use_jev": false,
+    "seed": 42,
+    "num_llm_calls": 7,
+    "num_recursive_llm_calls": 78,
+    "num_jev_calls": 0,
+    "total_llm_chars_in": 153118,
+    "total_recursive_llm_chars_in": 3975146,
+    "total_jev_chars_in": 0,
+    "time": 1480.497318200003,
+    "result": "'The magic number is 2867825.'"
+  }
+]
